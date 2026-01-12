@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.svm import SVC
 from sklearn.metrics import f1_score
-from sklearn.utils import shuffle
+from utils.dataLoad import load_YiChang_with_classes
 
 # 设置随机种子以保证结果可复现
 seed = 42
@@ -95,12 +95,12 @@ def prepare_state(X, y, num_classes):
 # 3. 主流程：数据生成、训练与测试
 # ==========================================
 def main():
-    print("正在生成不平衡数据...")
-    # 1. 生成合成不平衡数据集 (模拟论文 Case Study A)
-    # 少数类样本少，多数类样本多
-    X, y = make_classification(n_samples=1000, n_features=20, n_informative=15,
-                               n_redundant=5, weights=[0.9, 0.1],  # IR = 9:1
-                               n_classes=2, random_state=seed)
+    print("正在加载真实不平衡数据...")
+    # 1. 加载真实不平衡数据集
+    df = load_YiChang_with_classes()
+    y = df['ZH_CLASS'].values - 1
+    X = df.drop('ZH_CLASS', axis=1).values
+    num_classes = len(np.unique(y))
 
     # 数据集划分：训练集、验证集、测试集
     X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=y)
@@ -113,11 +113,11 @@ def main():
     X_val = scaler.transform(X_val)
     X_test = scaler.transform(X_test)
 
-    print(f"训练集大小: {len(X_train)} (少数类: {sum(y_train == 1)})")
+    print(f"训练集大小: {len(X_train)} (类别分布: {np.bincount(y_train)})")
     print(f"验证集大小: {len(X_val)}")
 
     # 参数设置
-    input_dim = X_train.shape[1] + 3  # 特征数 + 类别数(3)
+    input_dim = X_train.shape[1] + num_classes  # 特征数 + 类别数
     hidden_dim = 64
     learning_rate = 0.001
     episodes = 50  # 对应论文中的 Time steps / Episodes
@@ -141,7 +141,7 @@ def main():
     for episode in range(episodes):
         # 论文提到每个 time step 可以 shuffle 样本，这里简化为固定顺序或手动 shuffle
         # 构建状态
-        state = prepare_state(X_train, y_train, num_classes=3)
+        state = prepare_state(X_train, y_train, num_classes=num_classes)
 
         # 获取动作概率 (Batch=1, Seq_Len=N, Actions=2)
         # probs[:, :, 0]是不选的概率, probs[:, :, 1]是选的概率
