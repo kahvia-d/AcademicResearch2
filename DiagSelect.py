@@ -117,7 +117,7 @@ def main():
     print(f"验证集大小: {len(X_val)}")
 
     # 参数设置
-    input_dim = X_train.shape[1] + 2  # 特征数 + 类别数(2)
+    input_dim = X_train.shape[1] + 3  # 特征数 + 类别数(3)
     hidden_dim = 64
     learning_rate = 0.001
     episodes = 50  # 对应论文中的 Time steps / Episodes
@@ -141,7 +141,7 @@ def main():
     for episode in range(episodes):
         # 论文提到每个 time step 可以 shuffle 样本，这里简化为固定顺序或手动 shuffle
         # 构建状态
-        state = prepare_state(X_train, y_train, num_classes=2)
+        state = prepare_state(X_train, y_train, num_classes=3)
 
         # 获取动作概率 (Batch=1, Seq_Len=N, Actions=2)
         # probs[:, :, 0]是不选的概率, probs[:, :, 1]是选的概率
