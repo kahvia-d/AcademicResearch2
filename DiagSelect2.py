@@ -4,8 +4,10 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import f1_score, confusion_matrix
-from sklearn.datasets import make_classification
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+from utils.dataLoad import load_YiChang_with_classes
+from models.RacAdvancedClassifier import RacAdvancedClassifier
 
 
 # ==========================================
@@ -29,28 +31,6 @@ class DiagSelectAgent(nn.Module):
         return probs.squeeze(0), h_next
 
 
-# ==========================================
-# 2. 基础诊断模型 (Section III-A, f_dig)
-# ==========================================
-class DiagnosisMLP(nn.Module):
-    """
-    一个更真实的诊断模型，增加深度以符合实际工业场景
-    """
-
-    def __init__(self, input_dim, num_classes):
-        super(DiagnosisMLP, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
-
-    def forward(self, x):
-        return self.net(x)
 
 
 # ==========================================
@@ -75,37 +55,45 @@ class DiagSelectFramework:
             recalls = np.nan_to_num(recalls)
         return np.exp(np.mean(np.log(recalls + 1e-7)))
 
-    def train_base_model(self, train_loader, val_x, val_y):
+    def train_base_model(self, train_x, train_y, val_x, val_y):
         """
-        真实的诊断模型训练过程，包含完整的 Epoch 迭代
+        使用 RacAdvancedClassifier 进行训练和评估
         """
-        model = DiagnosisMLP(self.feat_dim, self.num_classes)
-        optimizer = optim.Adam(model.parameters(), lr=0.01)  # 基础模型常用 Adam
-        criterion = nn.CrossEntropyLoss()
+        # 转换为 numpy 格式
+        # RacAdvancedClassifier 需要 1-based labels (1, 2, 3...)
+        # train_y 和 val_y 假设是 0-based
+        X_train = train_x.cpu().numpy()
+        y_train = train_y.cpu().numpy() + 1
+        X_val = val_x.cpu().numpy()
+        y_true = val_y.cpu().numpy()
 
-        # 更加真实的训练周期 (不再是之前的 10 step)
-        model.train()
-        for epoch in range(30):
-            for batch_x, batch_y in train_loader:
-                if batch_x.size(0) <= 1:
-                    continue
-                optimizer.zero_grad()
-                output = model(batch_x)
-                loss = criterion(output, batch_y)
-                loss.backward()
-                optimizer.step()
+        # 检查类别数量，防止无法训练
+        # 如果选出的样本类别太少，可能导致 RAC 内部逻辑(如 OPW 需要 1,2 类) 报错
+        # 但 RAC 内部也有处理。这里做个简单保护
+        if len(np.unique(y_train)) < 2:
+            return 0.0
 
-        # 验证集评估
-        model.eval()
-        with torch.no_grad():
-            preds = torch.argmax(model(val_x), dim=1).cpu().numpy()
-            y_true = val_y.cpu().numpy()
+        try:
+            # 初始化并训练分类器
+            # verbose=False 以减少输出
+            clf = RacAdvancedClassifier(kernel_type='rbf', kernel_pars=[10.7], c=7.5, verbose=False)
+            clf.fit(X_train, y_train)
+
+            # 预测
+            preds = clf.predict(X_val)
+
+            # 还原为 0-based 用于计算指标
+            preds_0based = preds - 1
+
             # 论文关键：使用 Macro-F1 作为主要奖励信号 (Eq. 14)
-            f1 = f1_score(y_true, preds, average='macro')
-            gmean = self._calculate_g_mean(y_true, preds)
+            f1 = f1_score(y_true, preds_0based, average='macro')
+            gmean = self._calculate_g_mean(y_true, preds_0based)
             # 综合奖励 (可根据论文具体偏好调整比例)
             reward = 0.5 * f1 + 0.5 * gmean
-        return reward
+            return reward
+        except Exception as e:
+            # print(f"Training failed: {e}")
+            return 0.0
 
     def run_offline_training(self, train_x, train_y, val_x, val_y, T=10, epi=5):
         """
@@ -124,6 +112,7 @@ class DiagSelectFramework:
             probs, h_t = self.agent(s_t, h_t)
 
             trajectories = []  # 记录 epi 次采样的结果
+            total_selected_count = 0
 
             for k in range(epi):
                 # Eq. (12): 采样动作
@@ -133,18 +122,21 @@ class DiagSelectFramework:
 
                 # Algorithm 1, Line 10: 筛选子集
                 selected_mask = (actions == 1)
-                if selected_mask.sum() < self.num_classes * 2:  # 保护机制：样本太少无法训练
+                selected_count = selected_mask.sum().item()
+                total_selected_count += selected_count
+
+                if selected_count < self.num_classes * 2:  # 保护机制：样本太少无法训练
                     reward = 0.0
                 else:
                     sel_x = train_x[selected_mask]
                     sel_y = train_y[selected_mask]
 
-                    # 封装成 DataLoader 进行标准训练
-                    ds = TensorDataset(sel_x, sel_y)
-                    loader = DataLoader(ds, batch_size=32, shuffle=True)
-                    reward = self.train_base_model(loader, val_x, val_y)
+                    # 直接传递数据给 train_base_model
+                    reward = self.train_base_model(sel_x, sel_y, val_x, val_y)
 
                 trajectories.append((log_probs, reward))
+
+            avg_selected = total_selected_count / epi
 
             # --- 策略梯度更新 (Eq. 15) ---
             # 计算 epi 次采样的平均奖励作为 Baseline 以减小方差
@@ -164,7 +156,7 @@ class DiagSelectFramework:
             # Detach hidden state to prevent backpropagating into the graph with modified parameters
             h_t = h_t.detach()
 
-            print(f"Step [{t + 1}/{T}] | Avg Reward: {mean_reward:.4f} | Selected Avg: {selected_mask.sum().item()}")
+            print(f"Step [{t + 1}/{T}] | Avg Reward: {mean_reward:.4f} | Selected Avg: {avg_selected:.1f}")
 
             # Algorithm 1, Line 16: 随机打乱训练集样本顺序
             perm = torch.randperm(train_x.size(0))
@@ -172,22 +164,128 @@ class DiagSelectFramework:
 
 
 # ==========================================
-# 4. 模拟真实的不均衡故障数据
+# 4. 数据加载与处理
 # ==========================================
-def generate_imbalanced_data():
-    # 模拟 43 维特征，4 类故障
-    X, y = make_classification(n_samples=300, n_features=43, n_informative=30,
-                               n_classes=4, weights=[0.7, 0.1, 0.1, 0.1],  # 极度不均衡
-                               n_clusters_per_class=1, random_state=42)
-    X = torch.FloatTensor(X)
-    y = torch.LongTensor(y)
-    return X[:200], y[:200], X[200:], y[200:]  # 划分训练/验证
+def load_and_process_data():
+    df = load_YiChang_with_classes()
+
+    # 假设 ZH_CLASS 是标签，且为 1, 2, 3
+    # 转换为 0-based: 0, 1, 2
+    # 注意：RacAdvancedClassifier 内部我们做了一些适配，这里只要保证 train_y 是 0,1,2 即可
+    y = df['ZH_CLASS'].values - 1
+    X = df.drop(columns=['ZH_CLASS']).values
+
+    # 划分数据集: 训练集 0.7, 验证集 0.1, 测试集 0.2
+    # 第一次划分：分出测试集 (0.2)
+    # stratify确保类别分布一致
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    # 第二次划分：从剩余的 (0.8) 中分出验证集 (0.1 / 0.8 = 0.125)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.125, stratify=y_temp, random_state=42
+    )
+
+    # 转换为 Tensor
+    trn_x = torch.FloatTensor(X_train)
+    trn_y = torch.LongTensor(y_train)
+    val_x = torch.FloatTensor(X_val)
+    val_y = torch.LongTensor(y_val)
+    tst_x = torch.FloatTensor(X_test)
+    tst_y = torch.LongTensor(y_test)
+
+    return trn_x, trn_y, val_x, val_y, tst_x, tst_y
 
 
 if __name__ == "__main__":
-    trn_x, trn_y, val_x, val_y = generate_imbalanced_data()
+    # 1. 准备数据
+    trn_x, trn_y, val_x, val_y, tst_x, tst_y = load_and_process_data()
 
-    framework = DiagSelectFramework(feat_dim=43, num_classes=4)
+    feat_dim = trn_x.shape[1]
+    num_classes = len(torch.unique(trn_y))
 
-    print(">>> 启动 DiagSelect 完整复现训练 (预计耗时较长，因为包含多次基础模型重训练)...")
-    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=200, epi=3)
+    print(f"Data Loaded: Train {trn_x.shape}, Val {val_x.shape}, Test {tst_x.shape}")
+    print(f"Features: {feat_dim}, Classes: {num_classes}")
+
+    # 2. 训练 Agent (老师学习怎么挑数据)
+    framework = DiagSelectFramework(feat_dim=feat_dim, num_classes=num_classes)
+    print("\n>>> Phase 1: 训练 Agent (寻找最佳筛选策略)...")
+    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=20, epi=3)
+
+    # =======================================================
+    # Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)
+    # =======================================================
+    print("\n>>> Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)...")
+
+    # 将 Agent 设置为评估模式
+    framework.agent.eval()
+
+    def select_best_subset(agent, x, y, num_classes):
+        """辅助函数：用 Agent 筛选数据"""
+        with torch.no_grad():
+            # 构造状态输入
+            y_onehot = F.one_hot(y, num_classes=num_classes).float()
+            s_t = torch.cat([x, y_onehot], dim=1).unsqueeze(0)
+            h_init = torch.zeros(1, 1, agent.hidden_dim)
+
+            # 获取概率
+            probs, _ = agent(s_t, h_init)
+
+            # 贪婪选择: 概率 > 0.5 的样本
+            selected_mask = (probs[:, 1] > 0.5)
+
+            # 如果筛选太少，就全部保留 (兜底策略)
+            if selected_mask.sum() < num_classes * 2:
+                print("  Warning: Agent 选得太少，保留全集")
+                return x, y
+
+            return x[selected_mask], y[selected_mask]
+
+    # 1. 从原训练集中挑最好的
+    final_trn_x, final_trn_y = select_best_subset(framework.agent, trn_x, trn_y, num_classes)
+    # 2. 从原验证集中挑最好的
+    final_val_x, final_val_y = select_best_subset(framework.agent, val_x, val_y, num_classes)
+
+    # 3. 合并
+    combined_X = torch.cat([final_trn_x, final_val_x], dim=0)
+    combined_y = torch.cat([final_trn_y, final_val_y], dim=0)
+
+    print(f"  原始总数: {len(trn_x) + len(val_x)}")
+    print(f"  筛选后总数: {len(combined_X)} (Train选出 {len(final_trn_x)} + Val选出 {len(final_val_x)})")
+
+    # =======================================================
+    # Phase 3: 在测试集上进行最终测试
+    # =======================================================
+    print("\n>>> Phase 3: 训练最终分类器并测试...")
+
+    # 转换 tensor -> numpy 用于 RacAdavancedClassifier
+    X_train_final = combined_X.numpy()
+    y_train_final = combined_y.numpy() + 1 # 0-based -> 1-based
+
+    X_test_final = tst_x.numpy()
+    y_test_final = tst_y.numpy()
+
+    # 最终训练
+    clf_final = RacAdvancedClassifier(kernel_type='rbf', kernel_pars=[10.7], c=7.5, verbose=True)
+    clf_final.fit(X_train_final, y_train_final)
+
+    # 最终预测
+    preds = clf_final.predict(X_test_final)
+    preds_0based = preds - 1
+
+    # 计算最终指标
+    final_f1 = f1_score(y_test_final, preds_0based, average='macro')
+    # confusion_matrix 需要 ensure labels
+    cm = confusion_matrix(y_test_final, preds_0based, labels=range(num_classes))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        recalls = np.diag(cm) / cm.sum(axis=1)
+        recalls = np.nan_to_num(recalls)
+    final_gmean = np.exp(np.mean(np.log(recalls + 1e-7)))
+
+    print("="*40)
+    print(f"Final Test Result:")
+    print(f"Macro F1 Score : {final_f1:.4f}")
+    print(f"G-Mean Score   : {final_gmean:.4f}")
+    print("="*40)
+
