@@ -232,13 +232,8 @@ if __name__ == "__main__":
             # 获取概率
             probs, _ = agent(s_t, h_init)
 
-            # Debug: 打印概率统计信息
-            prob_select = probs[:, 1]
-            print(f"  Debug: Probs mean={prob_select.mean():.4f}, min={prob_select.min():.4f}, max={prob_select.max():.4f}")
-
             # 贪婪选择: 概率 > 0.5 的样本
             selected_mask = (probs[:, 1] > 0.5)
-            print(f"  Debug: Selected count before fallback: {selected_mask.sum().item()} / {x.size(0)}")
 
             # 如果筛选太少，就全部保留 (兜底策略)
             if selected_mask.sum() < num_classes * 2:
