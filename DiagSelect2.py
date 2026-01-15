@@ -211,7 +211,7 @@ if __name__ == "__main__":
     # 2. 训练 Agent (老师学习怎么挑数据)
     framework = DiagSelectFramework(feat_dim=feat_dim, num_classes=num_classes)
     print("\n>>> Phase 1: 训练 Agent (寻找最佳筛选策略)...")
-    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=1000, epi=3)
+    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=500, epi=3)
 
     # =======================================================
     # Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)
