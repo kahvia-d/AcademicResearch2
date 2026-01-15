@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
+import copy  # 用于深拷贝最佳模型权重
 from sklearn.metrics import f1_score, confusion_matrix
 from sklearn.model_selection import train_test_split
 
@@ -14,7 +15,7 @@ from models.RacAdvancedClassifier import RacAdvancedClassifier
 # 1. 智能体模型 (Section III-B, Eq. 6-11)
 # ==========================================
 class DiagSelectAgent(nn.Module):
-    def __init__(self, input_dim, hidden_dim=80):  # 论文 Section IV-A-1: H=80
+    def __init__(self, input_dim, hidden_dim=16):  # 论文 Section IV-A-1: H=80
         super(DiagSelectAgent, self).__init__()
         # 对应 Eq. (6-9): GRU 提取样本间的时序依赖或全局统计特征
         self.hidden_dim = hidden_dim
@@ -31,12 +32,11 @@ class DiagSelectAgent(nn.Module):
         return probs.squeeze(0), h_next
 
 
-
-
 # ==========================================
 # 3. 核心算法类 (Algorithm 1 & Section III-D)
 # ==========================================
 class DiagSelectFramework:
+    # agent的学习率设置为0.001
     def __init__(self, feat_dim, num_classes, agent_lr=1e-3, base_lr=1e-2):
         self.feat_dim = feat_dim
         self.num_classes = num_classes
@@ -45,13 +45,18 @@ class DiagSelectFramework:
         # 论文 Section IV-A-1: Agent 使用 RMSprop 优化器
         self.agent_optimizer = optim.RMSprop(self.agent.parameters(), lr=agent_lr)
 
+        # --- [新增监控变量] ---
+        self.reward_history = []
+        self.best_reward = -float('inf')
+        self.best_agent_state = None
+
     def _calculate_g_mean(self, y_true, y_pred):
         """
         对应 Section III-D: 评价指标 G-Mean
         """
         cm = confusion_matrix(y_true, y_pred, labels=range(self.num_classes))
         with np.errstate(divide='ignore', invalid='ignore'):
-            recalls = np.diag(cm) / cm.sum(axis=1)
+            recalls = np.diag(cm) / (cm.sum(axis=1) + 1e-7)  # 加上 epsilon 防止除零
             recalls = np.nan_to_num(recalls)
         return np.exp(np.mean(np.log(recalls + 1e-7)))
 
@@ -95,12 +100,15 @@ class DiagSelectFramework:
             # print(f"Training failed: {e}")
             return 0.0
 
-    def run_offline_training(self, train_x, train_y, val_x, val_y, T=10, epi=5):
+    def run_offline_training(self, train_x, train_y, val_x, val_y, T=20, epi=5, patience=8):
         """
         严格执行 Algorithm 1: Offline Training
+        patience: [新增] 忍受奖励不增长的最大步数
         """
         # Algorithm 1, Line 3: 初始化隐状态
         h_t = torch.zeros(1, 1, self.agent.hidden_dim)
+
+        no_improve_counter = 0  # [新增] 早停计数器
 
         for t in range(T):
             # Algorithm 1, Line 6: 构造状态 s_t (特征+标签)
@@ -142,6 +150,7 @@ class DiagSelectFramework:
             # 计算 epi 次采样的平均奖励作为 Baseline 以减小方差
             rewards = [tr[1] for tr in trajectories]
             mean_reward = np.mean(rewards)
+            self.reward_history.append(mean_reward)  # [新增记录]
 
             policy_loss = []
             for lp, r in trajectories:
@@ -156,11 +165,30 @@ class DiagSelectFramework:
             # Detach hidden state to prevent backpropagating into the graph with modified parameters
             h_t = h_t.detach()
 
-            print(f"Step [{t + 1}/{T}] | Avg Reward: {mean_reward:.4f} | Selected Avg: {avg_selected:.1f}")
+            # --- [新增早停与监控逻辑] ---
+            status_msg = ""
+            if mean_reward > self.best_reward:
+                self.best_reward = mean_reward
+                self.best_agent_state = copy.deepcopy(self.agent.state_dict())
+                no_improve_counter = 0
+                status_msg = " (Best ⭐)"
+            else:
+                no_improve_counter += 1
+                status_msg = f" (No improve {no_improve_counter}/{patience})"
+
+            print(f"Step [{t + 1}/{T}] | Avg Reward: {mean_reward:.4f} | Selected Avg: {avg_selected:.1f}{status_msg}")
+
+            if no_improve_counter >= patience:
+                print(f">>> 触发早停机制，加载第 {t + 1 - patience} 步的最佳参数。")
+                break
 
             # Algorithm 1, Line 16: 随机打乱训练集样本顺序
             perm = torch.randperm(train_x.size(0))
             train_x, train_y = train_x[perm], train_y[perm]
+
+        # 训练结束，恢复最优 Agent
+        if self.best_agent_state is not None:
+            self.agent.load_state_dict(self.best_agent_state)
 
 
 # ==========================================
@@ -211,15 +239,17 @@ if __name__ == "__main__":
     # 2. 训练 Agent (老师学习怎么挑数据)
     framework = DiagSelectFramework(feat_dim=feat_dim, num_classes=num_classes)
     print("\n>>> Phase 1: 训练 Agent (寻找最佳筛选策略)...")
-    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=20, epi=3)
+    # 建议将 T 设大一点（比如 50），由 patience 自动控制结束
+    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=50, epi=5, patience=8)
 
     # =======================================================
     # Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)
     # =======================================================
-    print("\n>>> Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)...")
+    print("\n>>> Phase 2: 使用训练好的最佳 Agent 全局筛选数据 (Train + Val)...")
 
     # 将 Agent 设置为评估模式
     framework.agent.eval()
+
 
     def select_best_subset(agent, x, y, num_classes):
         """辅助函数：用 Agent 筛选数据"""
@@ -242,6 +272,7 @@ if __name__ == "__main__":
 
             return x[selected_mask], y[selected_mask]
 
+
     # 1. 从原训练集中挑最好的
     final_trn_x, final_trn_y = select_best_subset(framework.agent, trn_x, trn_y, num_classes)
     # 2. 从原验证集中挑最好的
@@ -261,7 +292,7 @@ if __name__ == "__main__":
 
     # 转换 tensor -> numpy 用于 RacAdavancedClassifier
     X_train_final = combined_X.numpy()
-    y_train_final = combined_y.numpy() + 1 # 0-based -> 1-based
+    y_train_final = combined_y.numpy() + 1  # 0-based -> 1-based
 
     X_test_final = tst_x.numpy()
     y_test_final = tst_y.numpy()
@@ -279,13 +310,12 @@ if __name__ == "__main__":
     # confusion_matrix 需要 ensure labels
     cm = confusion_matrix(y_test_final, preds_0based, labels=range(num_classes))
     with np.errstate(divide='ignore', invalid='ignore'):
-        recalls = np.diag(cm) / cm.sum(axis=1)
+        recalls = np.diag(cm) / (cm.sum(axis=1) + 1e-7)
         recalls = np.nan_to_num(recalls)
     final_gmean = np.exp(np.mean(np.log(recalls + 1e-7)))
 
-    print("="*40)
-    print(f"Final Test Result:")
+    print("=" * 40)
+    print(f"Final Test Result (After DiagSelect):")
     print(f"Macro F1 Score : {final_f1:.4f}")
     print(f"G-Mean Score   : {final_gmean:.4f}")
-    print("="*40)
-
+    print("=" * 40)

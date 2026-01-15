@@ -70,7 +70,8 @@ class RacAdvancedClassifier(BaseEstimator, ClassifierMixin):
         classes, counts = np.unique(y, return_counts=True)
         weights = np.zeros(len(y))
         for i, label in enumerate(y):
-            weights[i] = counts.max() / counts[classes == label]
+            # weights[i] = counts.max() / counts[classes == label]
+            weights[i] = 1
         return weights
 
     def _expand_y_to_matrix(self, y, classes):
