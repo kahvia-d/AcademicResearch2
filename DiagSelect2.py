@@ -60,6 +60,45 @@ class DiagSelectFramework:
             recalls = np.nan_to_num(recalls)
         return np.exp(np.mean(np.log(recalls + 1e-7)))
 
+    def pre_train_agent(self, train_x, train_y, epochs=10):
+        """
+        对应论文 Section III-B, Eq.(1): 预训练 Agent 使其初始概率对齐类别分布
+        """
+        print(">>> 正在进行 Agent 预训练...")
+        self.agent.train()
+
+        # 计算每个类别的样本比例，用于构造目标概率 p_ini
+        counts = torch.bincount(train_y)
+        probs_target = counts.float() / len(train_y)
+
+        # 构造目标分布：每个样本被选中的初始概率 = 其所属类别的占比
+        # target_p_ini shape: [num_samples, 2] -> [不选概率, 选中概率]
+        target_p_ini = torch.zeros(len(train_y), 2)
+        for i in range(len(train_y)):
+            p_class = probs_target[train_y[i]]
+            target_p_ini[i, 1] = p_class  # 第二维是选择概率
+            target_p_ini[i, 0] = 1 - p_class  # 第一维是不选概率
+
+        optimizer = optim.Adam(self.agent.parameters(), lr=1e-3)
+        h_0 = torch.zeros(1, 1, self.agent.hidden_dim)
+
+        for epoch in range(epochs):
+            y_onehot = F.one_hot(train_y, num_classes=self.num_classes).float()
+            s_t = torch.cat([train_x, y_onehot], dim=1).unsqueeze(0)
+
+            # 获取 Agent 当前输出
+            probs, _ = self.agent(s_t, h_0)
+
+            # 计算公式 (1) 的交叉熵损失
+            loss = -torch.mean(torch.sum(target_p_ini * torch.log(probs + 1e-7), dim=1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if (epoch + 1) % 5 == 0:
+                print(f"  Pre-train Epoch [{epoch + 1}/{epochs}] | Loss: {loss.item():.4f}")
+
     def train_base_model(self, train_x, train_y, val_x, val_y):
         """
         使用 RacAdvancedClassifier 进行训练和评估
@@ -238,9 +277,13 @@ if __name__ == "__main__":
 
     # 2. 训练 Agent (老师学习怎么挑数据)
     framework = DiagSelectFramework(feat_dim=feat_dim, num_classes=num_classes)
+
+    # --- 新增预训练调用 ---
+    framework.pre_train_agent(trn_x, trn_y, epochs=20)
+
     print("\n>>> Phase 1: 训练 Agent (寻找最佳筛选策略)...")
     # 建议将 T 设大一点（比如 50），由 patience 自动控制结束
-    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=50, epi=5, patience=8)
+    framework.run_offline_training(trn_x, trn_y, val_x, val_y, T=20, epi=3, patience=800)
 
     # =======================================================
     # Phase 2: 使用训练好的 Agent 全局筛选数据 (Train + Val)
@@ -309,6 +352,7 @@ if __name__ == "__main__":
     final_f1 = f1_score(y_test_final, preds_0based, average='macro')
     # confusion_matrix 需要 ensure labels
     cm = confusion_matrix(y_test_final, preds_0based, labels=range(num_classes))
+    print(cm)
     with np.errstate(divide='ignore', invalid='ignore'):
         recalls = np.diag(cm) / (cm.sum(axis=1) + 1e-7)
         recalls = np.nan_to_num(recalls)
