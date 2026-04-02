@@ -13,7 +13,7 @@ from utils.kernel_matrix import kernel_matrix
 
 class RacAdvancedClassifier(BaseEstimator, ClassifierMixin):
     """
-    RAC (Reject and Classify) Advanced Classifier
+    RAC (Regression and Classification) Advanced Classifier
 
     This is an optimized implementation that integrates both ordinal and OPW models
     into a single class, sharing common computations (especially kernel matrices)
@@ -53,25 +53,33 @@ class RacAdvancedClassifier(BaseEstimator, ClassifierMixin):
         self.output_weight_opw = None
         self.classes_opw = None
 
-    def _set_sample_weight(self, y):
+    def _set_ordinal_weight(self, y):
         """
-        Calculate sample weights based on class imbalance.
+        Set sample weights for the ordinal model.
+        Since we plan to use DROS to externally augment the minority class (Class 3),
+        we use neutral/uniform weights here to preserve the original density
+        distribution for the regression gradient.
+        """
+        return np.ones(len(y))
 
-        Parameters
-        ----------
-        y : array-like of shape (n_samples,)
-            Target values
-
-        Returns
-        -------
-        weights : ndarray of shape (n_samples,)
-            Sample weights
+    def _set_opw_weight(self, y):
+        """
+        Calculate sample weights for OPW based on cost-sensitive learning.
+        weight_class = total_samples / (n_classes * class_samples)
         """
         classes, counts = np.unique(y, return_counts=True)
+        total_samples = len(y)
+        n_classes = len(classes)
         weights = np.zeros(len(y))
+        
+        weight_dict = {
+            cls: total_samples / (n_classes * count) 
+            for cls, count in zip(classes, counts)
+        }
+        
         for i, label in enumerate(y):
-            # weights[i] = counts.max() / counts[classes == label]
-            weights[i] = 1
+            weights[i] = weight_dict[label]
+            
         return weights
 
     def _expand_y_to_matrix(self, y, classes):
@@ -117,7 +125,7 @@ class RacAdvancedClassifier(BaseEstimator, ClassifierMixin):
         if self.verbose:
             print("Training ordinal model on full dataset...")
         self.x_train_ordinal = X
-        self.sample_weight_ordinal = self._set_sample_weight(y)
+        self.sample_weight_ordinal = self._set_ordinal_weight(y)
 
         # Compute full kernel matrix (shared computation)
         if self.verbose:
@@ -145,7 +153,7 @@ class RacAdvancedClassifier(BaseEstimator, ClassifierMixin):
             print(f"Training OPW model on classes 1 and 2 ({len(y_12)} samples)...")
         self.x_train_opw = X_12
         self.classes_opw = np.unique(y_12)
-        self.sample_weight_opw = self._set_sample_weight(y_12)
+        self.sample_weight_opw = self._set_opw_weight(y_12)
 
         # **Key Optimization**: Extract submatrix instead of recomputing
         if self.verbose:
