@@ -15,18 +15,21 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
     """
     RAC (Reject and Classify) Probabilistic Classifier
 
-    A two-stage hybrid classifier for ordinal imbalanced classification.
+    This classifier follows a minority-preserving two-stage design:
 
     Stage 1:
-        - Train an ordinal regression model on the full dataset.
-        - Convert the continuous ordinal output into a pseudo-probability distribution.
-        - Use a confidence measure (margin between the top-1 and top-2 probabilities)
-          to identify uncertain samples.
-        - Only confident samples predicted as the minority class are accepted directly.
+        Train an ordinal regression model on the full dataset.
+        Convert its continuous output into a pseudo-probability distribution.
+        If a sample is predicted as the minority class with sufficiently high confidence,
+        accept it directly as the minority class.
 
     Stage 2:
-        - Train a standard classifier only on the non-minority classes.
-        - All remaining samples are forwarded to this classifier.
+        All remaining samples are forwarded to a standard classifier trained only
+        on the non-minority classes.
+
+    Therefore:
+        - Ordinal regression is only used to detect and accept confident minority samples.
+        - Standard classification is only used to distinguish majority classes.
 
     Parameters
     ----------
@@ -41,19 +44,15 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
 
     sigma : float, default=1.0
         Smoothing parameter used in pseudo-probability generation:
-        score_k = exp(- (y_hat - k)^2 / (2*sigma^2))
+            score_k = exp(- (y_hat - k)^2 / (2*sigma^2))
 
     uncertainty_ratio : float or None, default=0.3
-        Proportion of the most uncertain samples to reject within the uncertainty pool.
-        Smaller confidence values indicate higher uncertainty.
+        Among samples in the uncertainty pool, the bottom uncertainty_ratio proportion
+        (lowest confidence) will be rejected from direct minority acceptance.
 
     absolute_threshold : float or None, default=None
-        Optional absolute threshold on confidence. Samples with confidence below this
+        Optional absolute confidence threshold. Samples with confidence below this
         threshold enter the uncertainty pool first.
-
-    narrow_uncertainty_scope : bool, default=True
-        If True, uncertainty filtering is only applied to samples whose ordinal prediction
-        is the minority class. If False, all samples can be considered in the uncertainty pool.
 
     verbose : bool, default=False
         Whether to print progress messages.
@@ -67,7 +66,6 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         sigma=1.0,
         uncertainty_ratio=0.3,
         absolute_threshold=None,
-        narrow_uncertainty_scope=True,
         verbose=False
     ):
         self.kernel_type = kernel_type
@@ -76,19 +74,18 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         self.sigma = sigma
         self.uncertainty_ratio = uncertainty_ratio
         self.absolute_threshold = absolute_threshold
-        self.narrow_uncertainty_scope = narrow_uncertainty_scope
         self.verbose = verbose
 
         self.classes_ = None
         self.minority_class_ = None
-        self.non_minority_classes_ = None
+        self.majority_classes_ = None
 
         # Ordinal model parameters
         self.x_train_ordinal = None
         self.sample_weight_ordinal = None
         self.output_weight_ordinal = None
 
-        # OPW model parameters
+        # Majority-class classifier parameters
         self.x_train_opw = None
         self.sample_weight_opw = None
         self.output_weight_opw = None
@@ -101,7 +98,6 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         classes, counts = np.unique(y, return_counts=True)
         class_to_count = dict(zip(classes, counts))
         max_count = counts.max()
-
         weights = np.array([max_count / class_to_count[label] for label in y], dtype=float)
         return weights
 
@@ -116,21 +112,25 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
 
     def fit(self, X, y):
         """
-        Fit the ordinal model on the full dataset and the OPW classifier
-        on the non-minority classes.
+        Fit:
+        1. Ordinal regression model on the full dataset.
+        2. Standard classifier on majority classes only.
         """
         self.classes_ = np.unique(y)
 
         classes, counts = np.unique(y, return_counts=True)
         self.minority_class_ = classes[np.argmin(counts)]
-        self.non_minority_classes_ = classes[classes != self.minority_class_]
+        self.majority_classes_ = classes[classes != self.minority_class_]
+
+        if len(self.majority_classes_) < 1:
+            raise ValueError("At least one majority class is required.")
 
         if self.verbose:
             print("Detected classes:", self.classes_)
             print("Minority class:", self.minority_class_)
-            print("Non-minority classes:", self.non_minority_classes_)
+            print("Majority classes:", self.majority_classes_)
 
-        # ===== Train Ordinal Model on Full Dataset =====
+        # ===== Train ordinal model on full dataset =====
         if self.verbose:
             print("Training ordinal model on full dataset...")
 
@@ -138,11 +138,10 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         self.sample_weight_ordinal = self._set_sample_weight(y)
 
         if self.verbose:
-            print("  - Computing kernel matrix for full dataset...")
+            print("  - Computing full kernel matrix...")
 
         kernel_matrix_full = kernel_matrix(X, self.kernel_type, self.kernel_pars)
 
-        # Regression-style ordinal target
         y_ordinal = y.reshape(-1, 1).astype(float)
 
         weighted_kernel_ordinal = self.sample_weight_ordinal[:, np.newaxis] * kernel_matrix_full
@@ -156,19 +155,19 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         if self.verbose:
             print("  - Ordinal model trained successfully")
 
-        # ===== Train OPW Model on Non-Minority Classes =====
-        mask_non_minority = np.isin(y, self.non_minority_classes_)
-        X_opw = X[mask_non_minority]
-        y_opw = y[mask_non_minority]
+        # ===== Train classifier on majority classes only =====
+        mask_majority = np.isin(y, self.majority_classes_)
+        X_opw = X[mask_majority]
+        y_opw = y[mask_majority]
 
         self.x_train_opw = X_opw
         self.classes_opw = np.unique(y_opw)
         self.sample_weight_opw = self._set_sample_weight(y_opw)
 
         if self.verbose:
-            print(f"Training OPW model on non-minority classes {self.classes_opw} ({len(y_opw)} samples)...")
+            print(f"Training majority-class classifier on classes {self.classes_opw} ({len(y_opw)} samples)...")
 
-        kernel_matrix_opw = kernel_matrix_full[np.ix_(mask_non_minority, mask_non_minority)]
+        kernel_matrix_opw = kernel_matrix_full[np.ix_(mask_majority, mask_majority)]
 
         y_opw_matrix = self._expand_y_to_matrix(y_opw, self.classes_opw)
         weighted_kernel_opw = self.sample_weight_opw[:, np.newaxis] * kernel_matrix_opw
@@ -180,7 +179,7 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         )
 
         if self.verbose:
-            print("  - OPW model trained successfully")
+            print("  - Majority-class classifier trained successfully")
 
         return self
 
@@ -195,7 +194,7 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         k_values : ndarray of shape (n_classes,)
             Class labels.
         y_hat : ndarray of shape (n_samples,)
-            Continuous ordinal predictions.
+            Continuous ordinal regression outputs.
         """
         kernel_matrix_test_ordinal = kernel_matrix(
             X, self.kernel_type, self.kernel_pars, self.x_train_ordinal
@@ -206,7 +205,6 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
 
         k_values = self.classes_.astype(float)
 
-        # Gaussian-like soft assignment with sigma
         scores = np.exp(-((y_hat - k_values) ** 2) / (2 * self.sigma ** 2))
         probs = scores / np.sum(scores, axis=1, keepdims=True)
 
@@ -216,10 +214,6 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         """
         Compute confidence using margin:
             confidence = top1_prob - top2_prob
-
-        Returns
-        -------
-        confidence : ndarray of shape (n_samples,)
         """
         if probs.shape[1] < 2:
             return np.ones(probs.shape[0])
@@ -228,52 +222,59 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         confidence = sorted_probs[:, -1] - sorted_probs[:, -2]
         return confidence
 
-    def _get_uncertainty_flags(self, ordinal_predictions, confidence):
+    def _get_uncertainty_flags(self, minority_pred_mask, confidence):
         """
-        Determine which samples are uncertain.
+        Determine which minority-predicted samples are uncertain.
 
-        Strategy:
-        1. Build an uncertainty pool using absolute_threshold if provided.
-        2. Optionally restrict the pool to samples predicted as minority class.
-        3. Within the pool, reject the lowest-confidence samples according to uncertainty_ratio.
+        Only samples predicted as the minority class are considered for rejection.
+        This preserves the original design intention:
+            ordinal regression only decides whether to accept a sample as minority.
 
         Returns
         -------
         uncertainty_flag : ndarray of shape (n_samples,), dtype=bool
+            True means the sample is too uncertain to be directly accepted as minority.
         """
         uncertainty_flag = np.zeros_like(confidence, dtype=bool)
 
-        if self.absolute_threshold is None and self.uncertainty_ratio is None:
-            return uncertainty_flag
+        # Only minority-predicted samples are candidates for direct acceptance/rejection
+        pool_mask = minority_pred_mask.copy()
 
-        # Step 1: initial uncertainty pool
+        # Optional absolute confidence threshold
         if self.absolute_threshold is not None:
-            pool_mask = (confidence < self.absolute_threshold)
-        else:
-            pool_mask = np.ones_like(confidence, dtype=bool)
+            pool_mask = pool_mask & (confidence < self.absolute_threshold)
 
-        # Step 2: optionally restrict scope to minority predictions
-        if self.narrow_uncertainty_scope:
-            pool_mask = pool_mask & (ordinal_predictions == self.minority_class_)
-
-        # Step 3: percentile-based filtering inside the pool
+        # If percentile-based rejection is used
         if self.uncertainty_ratio is not None:
-            pool_indices = np.where(pool_mask)[0]
-            if len(pool_indices) > 0:
-                pool_confidence = confidence[pool_indices]
-                dynamic_thresh = np.percentile(pool_confidence, self.uncertainty_ratio * 100)
+            candidate_indices = np.where(minority_pred_mask)[0]
 
-                # lower confidence => more uncertain
-                final_uncertain_indices = pool_indices[pool_confidence <= dynamic_thresh]
-                uncertainty_flag[final_uncertain_indices] = True
-        else:
+            if len(candidate_indices) > 0:
+                candidate_confidence = confidence[candidate_indices]
+
+                # If absolute threshold exists, only threshold-filtered samples enter percentile pool
+                if self.absolute_threshold is not None:
+                    candidate_indices = np.where(pool_mask)[0]
+                    candidate_confidence = confidence[candidate_indices]
+
+                if len(candidate_indices) > 0:
+                    dynamic_thresh = np.percentile(
+                        candidate_confidence,
+                        self.uncertainty_ratio * 100
+                    )
+                    final_uncertain_indices = candidate_indices[
+                        candidate_confidence <= dynamic_thresh
+                    ]
+                    uncertainty_flag[final_uncertain_indices] = True
+
+        elif self.absolute_threshold is not None:
+            # Only threshold control
             uncertainty_flag[pool_mask] = True
 
         return uncertainty_flag
 
-    def _predict_opw(self, X):
+    def _predict_majority_classifier(self, X):
         """
-        Predict with the OPW classifier on the non-minority classes.
+        Predict with the classifier trained only on majority classes.
         """
         kernel_matrix_test_opw = kernel_matrix(
             X, self.kernel_type, self.kernel_pars, self.x_train_opw
@@ -286,13 +287,14 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         """
         Predict final labels.
 
-        Pipeline:
-        - Stage 1: ordinal pseudo-probability prediction
-        - Accept confident minority-class predictions
-        - Stage 2: classify all remaining samples with OPW
+        Logic:
+        1. Ordinal model produces pseudo-probabilities over all classes.
+        2. If predicted as minority class and confidence is high enough,
+           accept as minority class.
+        3. Otherwise, send the sample to the majority-class classifier.
         """
         n_samples = X.shape[0]
-        y_pred = np.zeros(n_samples, dtype=self.classes_.dtype)
+        y_pred = np.empty(n_samples, dtype=self.classes_.dtype)
 
         if self.verbose:
             print("Stage 1: Ordinal probabilistic prediction...")
@@ -300,41 +302,40 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         probs, k_values, y_hat = self._get_ordinal_probabilities(X)
         ordinal_predictions = k_values[np.argmax(probs, axis=1)]
         confidence = self._compute_confidence(probs)
-        uncertainty_flag = self._get_uncertainty_flags(ordinal_predictions, confidence)
 
-        # Only confident minority-class predictions are accepted directly
-        mask_accept_minority = (
-            (ordinal_predictions == self.minority_class_) &
-            (~uncertainty_flag)
-        )
-        y_pred[mask_accept_minority] = self.minority_class_
+        minority_pred_mask = (ordinal_predictions == self.minority_class_)
+        uncertainty_flag = self._get_uncertainty_flags(minority_pred_mask, confidence)
+
+        # Accept only confident minority predictions
+        accept_minority_mask = minority_pred_mask & (~uncertainty_flag)
+        y_pred[accept_minority_mask] = self.minority_class_
 
         if self.verbose:
-            n_minority_pred = np.sum(ordinal_predictions == self.minority_class_)
-            n_rejected_minority = np.sum((ordinal_predictions == self.minority_class_) & uncertainty_flag)
-            n_accepted_minority = np.sum(mask_accept_minority)
+            n_minority_pred = np.sum(minority_pred_mask)
+            n_rejected = np.sum(minority_pred_mask & uncertainty_flag)
+            n_accepted = np.sum(accept_minority_mask)
 
-            print(f"  - Initially predicted as minority class: {n_minority_pred}")
-            print(f"  - Rejected minority predictions due to uncertainty: {n_rejected_minority}")
-            print(f"  - Accepted minority predictions: {n_accepted_minority}")
+            print(f"  - Predicted as minority by ordinal model: {n_minority_pred}")
+            print(f"  - Rejected minority predictions due to uncertainty: {n_rejected}")
+            print(f"  - Accepted minority predictions: {n_accepted}")
 
-        # Remaining samples go to Stage 2
-        mask_remaining = ~mask_accept_minority
-        n_remaining = np.sum(mask_remaining)
+        # All other samples go to majority classifier
+        remaining_mask = ~accept_minority_mask
+        n_remaining = np.sum(remaining_mask)
 
         if n_remaining > 0:
             if self.verbose:
-                print(f"Stage 2: OPW prediction for {n_remaining} remaining samples...")
+                print(f"Stage 2: Majority-class classification for {n_remaining} samples...")
 
-            X_remaining = X[mask_remaining]
-            y_pred_opw, _ = self._predict_opw(X_remaining)
-            y_pred[mask_remaining] = y_pred_opw
+            X_remaining = X[remaining_mask]
+            y_pred_majority, _ = self._predict_majority_classifier(X_remaining)
+            y_pred[remaining_mask] = y_pred_majority
 
         return y_pred
 
     def get_stage_predictions(self, X):
         """
-        Return detailed outputs for analysis and debugging.
+        Return detailed intermediate results for analysis.
 
         Returns
         -------
@@ -342,12 +343,15 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
             {
                 'final_predictions': final labels,
                 'ordinal_predictions': stage-1 predicted labels from pseudo-probabilities,
-                'opw_predictions': stage-2 predictions for routed samples, otherwise -1,
-                'accepted_minority_mask': boolean mask of directly accepted minority samples,
+                'majority_predictions': stage-2 predictions for routed samples, otherwise -1,
+                'accept_minority_mask': boolean mask of directly accepted minority samples,
+                'minority_pred_mask': boolean mask of samples predicted as minority by ordinal model,
                 'probs': pseudo-probabilities from ordinal regression,
                 'confidence': confidence values (margin),
                 'uncertainty_flag': uncertainty indicators,
-                'continuous_ordinal_output': raw continuous ordinal regression outputs
+                'continuous_ordinal_output': raw continuous ordinal outputs,
+                'minority_class': detected minority class,
+                'majority_classes': majority class labels
             }
         """
         n_samples = X.shape[0]
@@ -355,39 +359,38 @@ class RacAdvancedProbabilisticClassifier(BaseEstimator, ClassifierMixin):
         probs, k_values, y_hat = self._get_ordinal_probabilities(X)
         ordinal_predictions = k_values[np.argmax(probs, axis=1)]
         confidence = self._compute_confidence(probs)
-        uncertainty_flag = self._get_uncertainty_flags(ordinal_predictions, confidence)
 
-        accepted_minority_mask = (
-            (ordinal_predictions == self.minority_class_) &
-            (~uncertainty_flag)
-        )
+        minority_pred_mask = (ordinal_predictions == self.minority_class_)
+        uncertainty_flag = self._get_uncertainty_flags(minority_pred_mask, confidence)
 
-        mask_remaining = ~accepted_minority_mask
+        accept_minority_mask = minority_pred_mask & (~uncertainty_flag)
+        remaining_mask = ~accept_minority_mask
 
-        opw_predictions = np.full(n_samples, -1, dtype=self.classes_.dtype)
-        opw_raw_outputs = None
+        majority_predictions = np.full(n_samples, -1, dtype=self.classes_.dtype)
+        majority_raw_outputs = None
 
-        if np.sum(mask_remaining) > 0:
-            X_remaining = X[mask_remaining]
-            y_pred_opw, opw_raw_outputs = self._predict_opw(X_remaining)
-            opw_predictions[mask_remaining] = y_pred_opw
+        if np.sum(remaining_mask) > 0:
+            X_remaining = X[remaining_mask]
+            y_pred_majority, majority_raw_outputs = self._predict_majority_classifier(X_remaining)
+            majority_predictions[remaining_mask] = y_pred_majority
 
         final_predictions = np.where(
-            accepted_minority_mask,
+            accept_minority_mask,
             self.minority_class_,
-            opw_predictions
+            majority_predictions
         )
 
         return {
             'final_predictions': final_predictions,
             'ordinal_predictions': ordinal_predictions,
-            'opw_predictions': opw_predictions,
-            'accepted_minority_mask': accepted_minority_mask,
+            'majority_predictions': majority_predictions,
+            'accept_minority_mask': accept_minority_mask,
+            'minority_pred_mask': minority_pred_mask,
             'probs': probs,
             'confidence': confidence,
             'uncertainty_flag': uncertainty_flag,
             'continuous_ordinal_output': y_hat,
             'minority_class': self.minority_class_,
-            'opw_classes': self.classes_opw,
-            'opw_raw_outputs': opw_raw_outputs
+            'majority_classes': self.majority_classes_,
+            'majority_raw_outputs': majority_raw_outputs
         }
